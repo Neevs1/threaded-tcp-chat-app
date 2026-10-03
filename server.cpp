@@ -1,86 +1,120 @@
 #include <iostream>
+#include <string>
 #include <cstring>
+#include <atomic>
+#include <thread>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <thread>
-#include <algorithm>
 
 #define MAX 100
 
-class tcp_client{
-    int port, queue_length,server_sockfd, client_sockfd;
-    struct sockaddr_in server_addr, client_addr;
-    socklen_t addr_len;
-    char buffer[MAX];
-    public:
-    int create_socket(){
-        int server_sockfd = socket(AF_INET, SOCK_STREAM, 0);
-        return server_sockfd;
+class TcpChatServer {
+    static const int QUEUE_LENGTH = 5;
+
+    int server_sockfd;
+    struct sockaddr_in server_addr;
+
+public:
+    TcpChatServer() : server_sockfd(-1) {}
+
+    ~TcpChatServer() {
+        if (server_sockfd >= 0) close(server_sockfd);
     }
 
-    tcp_client(){
-        
-        this->server_sockfd = create_socket();
-        if(server_sockfd < 0){
-            std::cout<<"Encountered error while creating a socket. Terminated"<<std::endl;
-            return;
+    // Returns false if setup failed
+    bool setup() {
+        server_sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (server_sockfd < 0) {
+            std::cerr << "Encountered error while creating a socket. Terminated\n";
+            return false;
         }
 
-         // Initialize server address
         memset(&server_addr, 0, sizeof(server_addr));
-        this->server_addr.sin_family = AF_INET;
-        this->server_addr.sin_addr.s_addr = INADDR_ANY;
-        this->server_addr.sin_port = htons(3400);
+        server_addr.sin_family = AF_INET;
+        server_addr.sin_addr.s_addr = INADDR_ANY;
+        server_addr.sin_port = htons(3400);
 
-        // Bind
-        int result = bind(server_sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr));
-        if(result != 0){
+        if (bind(server_sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) != 0) {
+            std::cerr << "Bind failed, try again\n";
             close(server_sockfd);
-            std::cout<<"Invalid port number, try again\n";
-            return;
+            server_sockfd = -1;
+            return false;
         }
-        int port = ntohs(server_addr.sin_port);
-        std::cout<<"PORT selected is "<<port<<std::endl;
-        std::cout<<"Enter length of queue"<<std::endl;
-        int queue_length = 1;
-        std::cin>>queue_length;
-        this->queue_length =  std::max(queue_length,1);
-        listenTo();
 
+        std::cout << "PORT selected is " << ntohs(server_addr.sin_port) << std::endl;
+
+        if (listen(server_sockfd, QUEUE_LENGTH) != 0) {
+            std::cerr << "Listen failed\n";
+            return false;
+        }
+        std::cout << "Max queue length is " << QUEUE_LENGTH << "\n";
+        return true;
     }
 
-    void listenTo(){
-        listen(this->server_sockfd, this->queue_length );
+    // Accepts clients one after another, forever. Handles one client
+    // fully (in its own thread) before the loop can accept the next,
+    // but the accept loop itself never stops on client disconnect.
+    void run() {
+        while (true) {
+            struct sockaddr_in client_addr;
+            socklen_t addr_len = sizeof(client_addr);
+
+            int client_sockfd = accept(server_sockfd, (struct sockaddr*)&client_addr, &addr_len);
+            if (client_sockfd < 0) {
+                std::cerr << "accept() failed\n";
+                continue;
+            }
+            std::cout << "Client connected!\n";
+
+            // handle this client in its own thread so the server can keep accepting
+            std::thread(&TcpChatServer::communicate, this, client_sockfd).detach();
+        }
     }
 
-    void communicate(){
-    this->addr_len = sizeof(this->client_addr);
+private:
+    void communicate(int client_sockfd) {
+        std::atomic<bool> running(true);
+        char buffer[MAX];
 
-    
-    client_sockfd = accept(server_sockfd, (struct sockaddr*)&client_addr, &addr_len);
+        // dedicated thread for receiving from this client
+        std::thread receiver([&]() {
+            while (running) {
+                int n = recv(client_sockfd, buffer, MAX - 1, 0);
+                if (n <= 0) {
+                    std::cout << "Client disconnected.\n";
+                    running = false;
+                    break;
+                }
+                buffer[n] = '\0';
+                std::cout << "\nClient: " << buffer << "\nServer reply: " << std::flush;
+            }
+        });
 
-    printf("Client connected!\n");
+        std::string line;
+        while (running) {
+            std::cout << "Server reply: ";
+            if (!std::getline(std::cin, line)) break;
+            if (line == "/quit") break;
 
-    while (1) {
-        int n = recv(client_sockfd, buffer, MAX, 0);
-        if (n <= 0) break;
+            if (send(client_sockfd, line.c_str(), line.size(), 0) < 0) {
+                std::cerr << "Send failed, connection may be closed\n";
+                break;
+            }
+        }
 
-        buffer[n] = '\0';
-        std::cout<<"Client :"<<buffer<<std::endl;
-
-        std::cout<<("Server reply: ");
-        std::cin.getline(buffer,99);
-
-        send(client_sockfd, buffer, strlen(buffer), 0);
+        running = false;
+        shutdown(client_sockfd, SHUT_RDWR);
+        receiver.join();
+        close(client_sockfd);
     }
-    }
-
 };
 
-int main(){
-    tcp_client client;
-    //client.listen();
-    client.communicate();
+int main() {
+    TcpChatServer server;
+    if (!server.setup()) {
+        return 1;
+    }
+    server.run();
+    return 0;
 }
-
